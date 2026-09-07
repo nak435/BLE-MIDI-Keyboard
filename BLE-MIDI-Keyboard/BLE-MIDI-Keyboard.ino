@@ -434,9 +434,11 @@ bool finishConnect() {
     }
     if (subs == 0) { g_statusMsg = "no notify characteristic"; return false; }
 
-    // remember this device so we can auto-reconnect without re-pairing next time
+    // remember this device so we can auto-reconnect without re-pairing next time.
+    // boot reads these NVS keys (not getNumBonds()) to decide whether to auto-connect.
     g_haveTarget = true;
     g_prefs.putString("addr", String(g_target.addr.toString().c_str()));
+    g_prefs.putUChar("atype", g_target.addr.getType());
     if (g_target.name.length()) g_prefs.putString("name", g_target.name);
     return true;
 }
@@ -466,6 +468,24 @@ void startScan() {
     s->start(0, false);
     g_state = ST_SCAN;
     g_statusMsg = "";
+}
+
+// forget the remembered keyboard and go back to scanning. The saved target in
+// NVS (g_prefs) is what boot uses, so removing it is authoritative even if the
+// NimBLE bond store misbehaves; deleteAllBonds() is best-effort on top.
+void forgetAll() {
+    abortConnect();
+    NimBLEDevice::getScan()->stop();
+    int before = NimBLEDevice::getNumBonds();
+    bool ok    = NimBLEDevice::deleteAllBonds();
+    int after  = NimBLEDevice::getNumBonds();
+    g_prefs.remove("name");
+    g_prefs.remove("addr");
+    g_prefs.remove("atype");
+    g_haveTarget = false;
+    Serial.printf("forget: deleteAllBonds()=%s  bonds %d -> %d ; NVS target cleared\n",
+                  ok ? "ok" : "FAIL", before, after);
+    startScan();
 }
 
 // ================= UI =================
@@ -657,8 +677,9 @@ void logGuide() {
                        g_target.name.c_str(), g_target.addr.toString().c_str());
         Serial.println("  connects automatically as soon as the keyboard wakes up");
         Serial.println("  (no action needed - just use the keyboard)");
-        Serial.println("  a  BTN-A press = cancel -> scan");
-        Serial.println("  b  BTN-B press = retry now");
+        Serial.println("  a  BTN-A press      = cancel -> scan");
+        Serial.println("  b  BTN-B press      = retry now");
+        Serial.println("  B  BTN-B long press = forget this keyboard");
         break;
     case ST_PLAY: {
         xSemaphoreTake(g_midiMutex, portMAX_DELAY);
@@ -680,6 +701,7 @@ void logGuide() {
         if (g_haveTarget) {
             Serial.println("  b  BTN-B press      = reconnect same device");
             Serial.println("  a  BTN-A press      = scan");
+            Serial.println("  B  BTN-B long press = forget this keyboard");
         } else {
             Serial.println("  a  BTN-A press      = back to scan");
         }
@@ -741,22 +763,18 @@ void setup() {
     NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
 
     g_prefs.begin("blemidi", false);
-    int nb = NimBLEDevice::getNumBonds();
-    Serial.printf("bonded devices: %d\n", nb);
-    if (nb > 0) {
-        // 既にボンド済み -> 起動直後から自動再接続待機に入る（操作不要）
-        // 前回接続した相手のアドレスを prefs から復元し、ボンド一覧と照合。
-        // 見つからなければ bond[0] にフォールバック。
-        String want = g_prefs.getString("addr", String());
-        NimBLEAddress pick = NimBLEDevice::getBondedAddress(0);
-        for (int i = 0; i < nb; i++) {
-            NimBLEAddress a = NimBLEDevice::getBondedAddress(i);
-            if (want.length() && want.equalsIgnoreCase(a.toString().c_str())) { pick = a; break; }
-        }
-        g_target.addr = pick;
-        g_target.name = g_prefs.getString("name", String("(bonded)"));
+    // 起動時の自動接続可否は「前回接続成功して NVS に保存した相手」の有無で決める。
+    // getNumBonds() に依存しないので、フルイレース後は必ずスキャンから始まる。
+    String savedAddr = g_prefs.getString("addr", String());
+    Serial.printf("bonded devices: %d ; saved target: %s\n",
+                  NimBLEDevice::getNumBonds(),
+                  savedAddr.length() ? savedAddr.c_str() : "(none)");
+    if (savedAddr.length()) {
+        uint8_t atype = g_prefs.getUChar("atype", 0);
+        g_target.addr  = NimBLEAddress(std::string(savedAddr.c_str()), atype);
+        g_target.name  = g_prefs.getString("name", String("(saved)"));
         g_target.isHID = true;
-        g_haveTarget = true;
+        g_haveTarget   = true;
         g_state = ST_WAIT;
         Serial.printf("known keyboard %s [%s] - auto-connecting\n",
                       g_target.name.c_str(), g_target.addr.toString().c_str());
@@ -795,14 +813,8 @@ void loop() {
 
         if (btnA() && n > 0) g_sel = (g_sel + 1) % n;   // BTN-A: advance cursor (wrap)
         if (btnAHold()) startScan();                    // BTN-A hold: rescan
-        if (btnBHold()) {                               // BTN-B hold: forget bonds
-            NimBLEDevice::getScan()->stop();
-            NimBLEDevice::deleteAllBonds();
-            g_prefs.remove("name");
-            g_prefs.remove("addr");
-            g_haveTarget = false;
-            Serial.println("all bonds deleted");
-            startScan();
+        if (btnBHold()) {                               // BTN-B hold: forget remembered keyboard
+            forgetAll();
         } else if (btnB() && n > 0) {                   // BTN-B: select
             xSemaphoreTake(g_devMutex, portMAX_DELAY);
             g_target = g_dev[g_sel];
@@ -842,6 +854,7 @@ void loop() {
             g_state = ST_FAILED;
             break;
         }
+        if (btnBHold()) { forgetAll(); break; }               // forget remembered keyboard
         if (btnA()) { abortConnect(); startScan(); break; }   // cancel
         if (btnB()) { abortConnect(); waitInit = false; }     // retry now
         drawWait();
@@ -872,7 +885,9 @@ void loop() {
         break;
 
     case ST_FAILED:
-        if (btnB() && g_haveTarget) {                   // retry same device (auto-wait)
+        if (btnBHold()) {                               // forget remembered keyboard
+            forgetAll();
+        } else if (btnB() && g_haveTarget) {           // retry same device (auto-wait)
             g_state = ST_WAIT;
         } else if (btnA()) {
             startScan();
