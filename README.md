@@ -1,5 +1,7 @@
 # BLE-MIDI-Keyboard (M5StickS3)
 
+（日本語: [README_JP.md](README_JP.md)）
+
 Turn an ordinary **BLE HID keyboard** into a **USB-MIDI keyboard controller**.
 
 The M5StickS3 connects to a BLE keyboard as a HID host, and at the same time
