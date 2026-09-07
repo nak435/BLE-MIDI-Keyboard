@@ -1,0 +1,4 @@
+default_fqbn: m5stack:esp32:m5stack_sticks3:PartitionScheme=default_8MB,USBMode=default,CDCOnBoot=cdc
+default_port: /dev/cu.usbmodem1101
+default_port_config:
+  baudrate: 115200
