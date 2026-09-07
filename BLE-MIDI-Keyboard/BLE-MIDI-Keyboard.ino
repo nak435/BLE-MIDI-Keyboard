@@ -343,6 +343,8 @@ static ScanCB   g_scanCB;
 static ClientCB g_clientCB;
 
 // ================= HID notification =================
+uint8_t g_hidPrev[8] = {0};      // last boot report; cleared on every new connection
+
 static bool inReport(const uint8_t* r, uint8_t k) {
     for (int i = 2; i < 8; i++) if (r[i] == k) return true;
     return false;
@@ -367,21 +369,20 @@ void handleKeyEvent(bool down, uint8_t usage) {
 
 void onHidNotify(NimBLERemoteCharacteristic*, uint8_t* data, size_t len, bool) {
     if (len < 8) return;
-    static uint8_t prev[8] = {0};
     uint8_t cur[8];
     memcpy(cur, data, 8);
 
     for (int b = 0; b < 8; b++) {                       // modifier bits
-        bool nowb = cur[0] & (1 << b), wasb = prev[0] & (1 << b);
+        bool nowb = cur[0] & (1 << b), wasb = g_hidPrev[0] & (1 << b);
         if (nowb && !wasb) handleKeyEvent(true,  0xE0 + b);
         if (!nowb && wasb) handleKeyEvent(false, 0xE0 + b);
     }
     for (int i = 2; i < 8; i++)                          // new key presses
-        if (cur[i] >= 0x04 && !inReport(prev, cur[i])) handleKeyEvent(true, cur[i]);
+        if (cur[i] >= 0x04 && !inReport(g_hidPrev, cur[i])) handleKeyEvent(true, cur[i]);
     for (int i = 2; i < 8; i++)                          // releases
-        if (prev[i] >= 0x04 && !inReport(cur, prev[i])) handleKeyEvent(false, prev[i]);
+        if (g_hidPrev[i] >= 0x04 && !inReport(cur, g_hidPrev[i])) handleKeyEvent(false, g_hidPrev[i]);
 
-    memcpy(prev, cur, 8);
+    memcpy(g_hidPrev, cur, 8);
 }
 
 // ================= connection =================
@@ -419,6 +420,11 @@ bool finishConnect() {
     NimBLERemoteCharacteristic* pm = svc->getCharacteristic(UUID_PROTOCOL_MODE);
     if (pm && pm->canWriteNoResponse()) { uint8_t boot = 0; pm->writeValue(&boot, 1, false); }
 
+    // clear translation state BEFORE subscribing so a report that arrives the
+    // instant we subscribe is not wiped afterwards (would leave a stuck note)
+    memset(g_hidPrev, 0, sizeof(g_hidPrev));
+    midiResetState();
+
     int subs = 0;
     for (auto* c : svc->getCharacteristics(true)) {
         if ((c->canNotify() || c->canIndicate()) && c->subscribe(true, onHidNotify, true)) {
@@ -430,6 +436,7 @@ bool finishConnect() {
 
     // remember this device so we can auto-reconnect without re-pairing next time
     g_haveTarget = true;
+    g_prefs.putString("addr", String(g_target.addr.toString().c_str()));
     if (g_target.name.length()) g_prefs.putString("name", g_target.name);
     return true;
 }
@@ -738,7 +745,15 @@ void setup() {
     Serial.printf("bonded devices: %d\n", nb);
     if (nb > 0) {
         // 既にボンド済み -> 起動直後から自動再接続待機に入る（操作不要）
-        g_target.addr = NimBLEDevice::getBondedAddress(0);
+        // 前回接続した相手のアドレスを prefs から復元し、ボンド一覧と照合。
+        // 見つからなければ bond[0] にフォールバック。
+        String want = g_prefs.getString("addr", String());
+        NimBLEAddress pick = NimBLEDevice::getBondedAddress(0);
+        for (int i = 0; i < nb; i++) {
+            NimBLEAddress a = NimBLEDevice::getBondedAddress(i);
+            if (want.length() && want.equalsIgnoreCase(a.toString().c_str())) { pick = a; break; }
+        }
+        g_target.addr = pick;
         g_target.name = g_prefs.getString("name", String("(bonded)"));
         g_target.isHID = true;
         g_haveTarget = true;
@@ -784,6 +799,7 @@ void loop() {
             NimBLEDevice::getScan()->stop();
             NimBLEDevice::deleteAllBonds();
             g_prefs.remove("name");
+            g_prefs.remove("addr");
             g_haveTarget = false;
             Serial.println("all bonds deleted");
             startScan();
@@ -807,8 +823,7 @@ void loop() {
             if (!beginConnect()) { g_state = ST_FAILED; break; }
         }
         if (g_connected) {                               // link up -> pair + discover + subscribe
-            if (finishConnect()) {
-                midiResetState();
+            if (finishConnect()) {                       // finishConnect() already reset MIDI state
                 g_finalFails = 0;
                 Serial.println("connected - translating keys to USB-MIDI");
                 g_state = ST_PLAY;
